@@ -68,44 +68,23 @@
 下面展示 6 段合成音频，每段下面附上对应的文本。
 
 ### 1️⃣ 日常对话
-<audio controls>
-  <source src="samples/baseline001.wav" type="audio/wav">
-</audio>
+**文本**：你说我昨晚熬夜啦？哎呀……被你发现啦。其实是因为我在追剧，因为太好看了，停不下来了呢。  
+- ▶️ [Baseline](samples/baseline001.wav?raw=1)  
+- ▶️ [Finetuned](samples/paimeng001.wav?raw=1)
 
-**Baseline**：你说我昨晚熬夜啦?哎呀...被你发现啦。其实是因为我在追剧，因为太好看了，停不下来了呢。
-
-<audio controls>
-  <source src="samples/paimeng001.wav" type="audio/wav">
-</audio>
-
-**Finetuned**：你说我昨晚熬夜啦?哎呀...被你发现啦。其实是因为我在追剧，因为太好看了，停不下来了呢。
+---
 
 ### 2️⃣ 正式对话
-<audio controls>
-  <source src="samples/baseline002.wav" type="audio/wav">
-</audio>  
+**文本**：如果我们把语音合成看作是一场音乐表演，那么每一个音素就是乐器的音符，只有在合适的时机停顿，才能让整体听起来更加自然。  
+- ▶️ [Baseline](samples/baseline002.wav?raw=1)  
+- ▶️ [Finetuned](samples/paimeng002.wav?raw=1)
 
-**Baseline**：如果我们把语音合成看作是一场音乐表演，那么每一个音素就是乐器的音符，只有在合适的时机停顿，才能让整体听起来更加自然。
-
-<audio controls>
-  <source src="samples/paimeng002.wav" type="audio/wav">
-</audio>  
-
-**Finetuned**：如果我们把语音合成看作是一场音乐表演，那么每一个音素就是乐器的音符，只有在合适的时机停顿，才能让整体听起来更加自然。
+---
 
 ### 3️⃣ 多语气与情绪
-<audio controls>
-  <source src="samples/baseline003.wav" type="audio/wav">
-</audio>  
-
-**Baseline**：嗯……好像是这样吧？欸，不过我还是有点怀疑啊。哎呀，算啦算啦，我们继续。
-
-<audio controls>
-  <source src="samples/paimeng003.wav" type="audio/wav">
-</audio>  
-
-**Finetuned**：嗯……好像是这样吧？欸，不过我还是有点怀疑啊。哎呀，算啦算啦，我们继续。
-
+**文本**：嗯……好像是这样吧？欸，不过我还是有点怀疑啊。哎呀，算啦算啦，我们继续。  
+- ▶️ [Baseline](samples/baseline003.wav?raw=1)  
+- ▶️ [Finetuned](samples/paimeng003.wav?raw=1)
 ---
 
 ## 🛠️ 快速开始
