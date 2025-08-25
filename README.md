@@ -8,10 +8,9 @@
 
 ## ✨ 亮点特性
 
-- **微调支持**：脚本化的一键实验流程（支持轻量快速试验）；
+- **微调支持**：一键实验流程（支持轻量快速试验）；
 - **评测闭环**：TTS 生成 → ASR 转写 → 指标计算（WER/CER/口型一致性占位）→ 报告输出；
 - **交互式工具**：Gradio 多页面（TTS / ASR / Finetune / Eval），一键对比；
-- **误传防护**：自检脚本 `scripts/audit_repo.py`，扫描大文件/黑名单后缀/潜在密钥。
 
 ---
 
@@ -62,7 +61,50 @@
 - **“磨砂感”**：可尝试提升参考样本 SNR、在数据侧做高频噪声控制；必要时调整声码器或尝试更干净的目标域数据；
 - **标点/停顿敏感性**：清洗与前端规则需要一致；建议在评测集里构造不同标点版本；
 - **短句泛化**：过多极短片段训练可能导致语调碎片化，建议和中长句比例平衡；
-- **多说话人混入**：若存在，需确保标注/采样方式不会引入跨说话人漂移。
+
+---
+## 🎧 模型合成音频示例
+
+下面展示 6 段合成音频，每段下面附上对应的文本。
+
+### 1️⃣ 日常对话
+<audio controls>
+  <source src="samples/baseline001.wav" type="audio/mpeg">
+</audio>
+
+**Baseline**：你说我昨晚熬夜啦?哎呀...被你发现啦。其实是因为我在追剧，因为太好看了，停不下来了呢。
+
+<audio controls>
+  <source src="samples/paimeng001.wav" type="audio/mpeg">
+</audio>
+
+**Finetuned**：你说我昨晚熬夜啦?哎呀...被你发现啦。其实是因为我在追剧，因为太好看了，停不下来了呢。
+
+### 2️⃣ 正式对话
+<audio controls>
+  <source src="samples/baseline002.wav" type="audio/mpeg">
+</audio>  
+
+**Baseline**：如果我们把语音合成看作是一场音乐表演，那么每一个音素就是乐器的音符，只有在合适的时机停顿，才能让整体听起来更加自然。
+
+<audio controls>
+  <source src="samples/paimeng002.wav" type="audio/mpeg">
+</audio>  
+
+**Finetuned**：如果我们把语音合成看作是一场音乐表演，那么每一个音素就是乐器的音符，只有在合适的时机停顿，才能让整体听起来更加自然。
+
+### 3️⃣ 多语气与情绪
+<audio controls>
+  <source src="samples/baseline003.wav" type="audio/mpeg">
+</audio>  
+
+**Baseline**：嗯……好像是这样吧？欸，不过我还是有点怀疑啊。哎呀，算啦算啦，我们继续。
+
+<audio controls>
+  <source src="samples/paimeng003.wav" type="audio/mpeg">
+</audio>  
+
+**Finetuned**：嗯……好像是这样吧？欸，不过我还是有点怀疑啊。哎呀，算啦算啦，我们继续。
 
 ---
 
