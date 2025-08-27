@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import csv
 import argparse
+import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -42,7 +43,7 @@ CONFIG = {
     # 列名候选（不区分大小写）
     "KEY_COLS": ["utt_id", "id", "key", "sid", "uid"],
     "WAV_COLS": ["wav", "wav_path", "path", "audio", "audio_path", "语音文件", "文件路径"],
-    "REF_COLS": ["text", "ref", "ref_text", "gt", "target", "参考文本"],
+    "REF_COLS": ["text", "ref", "ref_text", "gt", "target", "参考文本", "原始文本"],
     "ASR_A_COLS": ["asr_a", "hyp_a", "pred_a", "result_a", "transcript_a"],
     "ASR_B_COLS": ["asr_b", "hyp_b", "pred_b", "result_b", "transcript_b"],
     "ASR_COLS": ["asr", "hyp", "pred", "result", "transcript", "asr处理文本"],
@@ -51,11 +52,180 @@ CONFIG = {
     "OUT_DIR_DEFAULT": "./eval_out",
     "OUT_DETAIL": "detail.csv",
     "OUT_SUMMARY": "summary.csv",
+    "NORM_ENABLE": True,
+    "NORM_STRIP_PUNCT": True,
+    "NORM_STRIP_SPACES": True,
+    "NORM_STRIP_INTERJ": True,
+    "NORM_TO_SIMPLIFIED": True,  # 若系统未安装 opencc，则自动回退为 False
+    "NORM_CACHE_DIR": "./eval_out/_norm_cache",
+
+    "LONG_SENT_THRES": 12,
+    "PUNC_FOR_PROSODY": "，,。.!！?？、…；;：:",
+    "KEYWORDS_DEFAULT": ["哇","啊","嗯","嘿嘿","哈哈"],
+    "TARGET_CHARS_PER_SEC": 6.0,  # 目标语速（字符/秒），可根据语料调整
+
 }
 
 # =============================
 # [ADD] 轻量 Levenshtein（可选 rapidfuzz 加速）
 # =============================
+# =============================
+# [ADD] 评测指标实现（CER/WER/关键词/吞字/韵律/语速）
+# =============================
+
+# [ADD] 分词/标记：中文无空格时按“中英文混合”策略切分；英文/带空格用空格切分
+_word_re = re.compile(r"[A-Za-z0-9]+|[\u4e00-\u9fff]|[^\s]")
+
+def tokenize_for_wer(s: str):
+    s = (s or "").strip()
+    if not s:
+        return []
+    # 如果有空格，优先按空格（英文/带空格语料）
+    if " " in s.strip():
+        return s.split()
+    # 否则按“英文串/单个中文汉字/其他单字符”混合切分
+    return _word_re.findall(s)
+
+def wer_word(ref: str, hyp: str) -> float:
+    R = tokenize_for_wer(ref)
+    H = tokenize_for_wer(hyp)
+    if len(R) == 0:
+        return 0.0 if len(H) == 0 else 1.0
+    # 经典 Levenshtein on tokens
+    n, m = len(R), len(H)
+    dp = [[0]*(m+1) for _ in range(n+1)]
+    for i in range(n+1):
+        dp[i][0] = i
+    for j in range(m+1):
+        dp[0][j] = j
+    for i in range(1, n+1):
+        for j in range(1, m+1):
+            cost = 0 if R[i-1] == H[j-1] else 1
+            dp[i][j] = min(dp[i-1][j] + 1,     # deletion
+                           dp[i][j-1] + 1,     # insertion
+                           dp[i-1][j-1] + cost)  # substitution
+    return dp[n][m] / max(1, n)
+
+# [ADD] 编辑距离操作统计（用于“吞字率”=删除比例）
+def edit_ops(ref: str, hyp: str):
+    R = list(ref or "")
+    H = list(hyp or "")
+    n, m = len(R), len(H)
+    dp = [[0]*(m+1) for _ in range(n+1)]
+    bt = [[None]*(m+1) for _ in range(n+1)]
+    for i in range(n+1):
+        dp[i][0] = i
+        if i>0: bt[i][0] = ('D', i-1, 0)
+    for j in range(m+1):
+        dp[0][j] = j
+        if j>0: bt[0][j] = ('I', 0, j-1)
+    for i in range(1, n+1):
+        for j in range(1, m+1):
+            if R[i-1] == H[j-1]:
+                dp[i][j] = dp[i-1][j-1]
+                bt[i][j] = ('M', i-1, j-1)
+            else:
+                # choose best among D, I, S
+                cand = [
+                    (dp[i-1][j] + 1, 'D', i-1, j),    # deletion
+                    (dp[i][j-1] + 1, 'I', i, j-1),    # insertion
+                    (dp[i-1][j-1] + 1, 'S', i-1, j-1) # substitution
+                ]
+                best = min(cand, key=lambda x:x[0])
+                dp[i][j] = best[0]
+                bt[i][j] = (best[1], best[2], best[3])
+    # backtrace
+    i, j = n, m
+    dels = ins = subs = match = 0
+    while i>0 or j>0:
+        op, pi, pj = bt[i][j] if bt[i][j] else ('M', i-1, j-1)
+        if op == 'D': dels += 1
+        elif op == 'I': ins += 1
+        elif op == 'S': subs += 1
+        else: match += 1
+        i, j = pi, pj
+    return {'del':dels, 'ins':ins, 'sub':subs, 'match':match, 'dist':dp[n][m], 'n_ref':n, 'n_hyp':m}
+
+# [ADD] 吞字率（长句）：删除比例，仅在 ref_len >= 阈值 时计入
+def swallow_rate(ref: str, hyp: str, long_thres: int = 20) -> Optional[float]:
+    ref = ref or ""
+    hyp = hyp or ""
+    if len(ref) < long_thres:
+        return None
+    ops = edit_ops(ref, hyp)
+    return ops['del'] / max(1, ops['n_ref'])
+
+# [ADD] 基于标点的“韵律抖动方差”（代理指标）：
+#      以标点分段，计算“每段长度差（hyp-ref）”的方差/均方误差
+PUNC_DEFAULT = "，,。.!！?？、…；;：:"
+
+def _segments_by_punc(s: str, punc: str) -> list[int]:
+    buf = 0
+    arr = []
+    for ch in s or "":
+        if ch in punc:
+            arr.append(buf)
+            buf = 0
+        else:
+            buf += 1
+    arr.append(buf)
+    return arr
+
+def prosody_jitter_var(ref: str, hyp: str, punc: str = PUNC_DEFAULT) -> float:
+    a = _segments_by_punc(ref or "", punc)
+    b = _segments_by_punc(hyp or "", punc)
+    # 对齐较短长度
+    L = min(len(a), len(b)) if a and b else 0
+    if L == 0:
+        return 0.0
+    diffs = [(b[i]-a[i]) for i in range(L)]
+    # 归一化到 ref 段长，避免长度规模影响
+    norm = [ (diff / (a[i] if a[i]>0 else 1)) for i, diff in enumerate(diffs) ]
+    # 返回均方（方差代理）
+    return float(np.mean([x*x for x in norm]))
+
+# [ADD] 关键词一致性：计算 ref→hyp 的“召回率”，以及 hyp 中“额外关键词”比率
+def keyword_metrics(ref: str, hyp: str, keywords: List[str]) -> Tuple[Optional[float], Optional[float]]:
+    kws = [k for k in (keywords or []) if k]
+    if not kws:
+        return None, None
+    ref_hits = sum(1 for k in kws if k in (ref or ""))
+    hyp_hits = sum(1 for k in kws if k in (hyp or ""))
+    recall = (hyp_hits / ref_hits) if ref_hits>0 else (None)
+    # 额外关键词：hyp 中出现但 ref 中未出现的占比
+    extra = sum(1 for k in kws if (k in (hyp or "")) and (k not in (ref or "")))
+    extra_ratio = (extra / len(kws)) if kws else None
+    return recall, extra_ratio
+
+# [ADD] 语速误差：需要 wav 时长；若拿不到 wav 则返回 None
+def _wav_duration_seconds(path: str) -> Optional[float]:
+    try:
+        import soundfile as sf
+        import numpy as np  # noqa: F401
+        with sf.SoundFile(path) as f:
+            frames = len(f)
+            sr = f.samplerate
+        return frames / float(sr)
+    except Exception:
+        try:
+            import wave
+            with wave.open(path, 'rb') as wf:
+                frames = wf.getnframes()
+                sr = wf.getframerate()
+            return frames / float(sr)
+        except Exception:
+            return None
+
+def speed_error(ref: str, wav_path: Optional[str], target_chars_per_sec: Optional[float]) -> Optional[float]:
+    if not wav_path or not target_chars_per_sec or target_chars_per_sec <= 0:
+        return None
+    dur = _wav_duration_seconds(wav_path)
+    if not dur or dur <= 0:
+        return None
+    cps = (len(ref or "")) / dur
+    return abs(cps - target_chars_per_sec) / target_chars_per_sec  # 绝对误差比
+
+
 HAVE_RAPIDFUZZ = False
 try:
     from rapidfuzz.distance import Levenshtein  # type: ignore
@@ -96,6 +266,79 @@ def cer_char(ref: str, hyp: str) -> float:
 # =============================
 # [ADD] CSV 解析 & 列规范化
 # =============================
+
+# =============================
+# [ADD] 文本标准化（简繁/标点/空白/语气字/NFKC）
+# =============================
+def _try_opencc():
+    try:
+        from opencc import OpenCC  # type: ignore
+        return OpenCC('t2s')
+    except Exception:
+        return None
+
+_OPENCC = _try_opencc()
+if _OPENCC is None:
+    CONFIG["NORM_TO_SIMPLIFIED"] = False  # 回退：未安装 opencc 则不做简繁转换
+
+_INTERJ_SET = set(list("哇啊哦喔噢欸诶呃嗯唔呀嘿哈呵嘻哼呜"))  # 可再扩充
+
+import unicodedata
+
+def _nfkc(s: str) -> str:
+    try:
+        return unicodedata.normalize("NFKC", s or "")
+    except Exception:
+        return s or ""
+
+def _to_simplified(s: str) -> str:
+    if CONFIG.get("NORM_TO_SIMPLIFIED", False) and _OPENCC is not None:
+        try:
+            return _OPENCC.convert(s)
+        except Exception:
+            return s
+    return s
+
+def _strip_punct_and_spaces(s: str) -> str:
+    # 去所有 Unicode 标点与空白
+    return "".join(ch for ch in s if not unicodedata.category(ch).startswith("P") and not ch.isspace())
+
+def _strip_interjections(s: str) -> str:
+    # 简单逐字剔除常见语气字（工程取舍：避免把“内容词”误删）
+    return "".join(ch for ch in s if ch not in _INTERJ_SET)
+
+def normalize_text(s: str) -> str:
+    if s is None:
+        s = ""
+    s = str(s)
+    s = _nfkc(s)
+    s = _to_simplified(s)
+    if CONFIG.get("NORM_STRIP_PUNCT", True) or CONFIG.get("NORM_STRIP_SPACES", True):
+        s = _strip_punct_and_spaces(s)
+    if CONFIG.get("NORM_STRIP_INTERJ", True):
+        s = _strip_interjections(s)
+    return s
+
+def normalize_dataframe(std: StdFrame, tag: str) -> StdFrame:
+    """
+    返回新的 StdFrame，df 文本列已标准化；并把标准化后的 CSV 存到 NORM_CACHE_DIR 下。
+    仅处理：ref/asr/asr_a/asr_b（其余列保持不动）。
+    """
+    import os, pandas as pd, csv
+    df = std.df.copy()
+    cols = [c for c in [std.ref, std.asr, std.asr_a, std.asr_b] if c is not None]
+    if cols and CONFIG.get("NORM_ENABLE", True):
+        for c in cols:
+            df[c] = df[c].astype(str).map(normalize_text)
+    # 写入缓存
+    out_dir = CONFIG.get("NORM_CACHE_DIR", "./eval_out/_norm_cache")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{tag}_normalized.csv")
+    df.to_csv(out_path, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_ALL)
+    # 返回新的 StdFrame
+    std2 = StdFrame(df=df, key=std.key, wav=std.wav, ref=std.ref, asr=std.asr, asr_a=std.asr_a, asr_b=std.asr_b)
+    return std2
+
 LOWER = lambda s: (s or "").strip().lower()
 
 
@@ -212,6 +455,8 @@ def compare_single(std: StdFrame) -> CompareResult:
 
 
 def compare_two(stdA: StdFrame, stdB: StdFrame) -> CompareResult:
+    # [KEEP] 原有 A/B 文本直接 CER 对比（非常用）
+
     dfA = stdA.df.copy()
     dfB = stdB.df.copy()
     keyA = build_join_key(stdA)
@@ -256,6 +501,115 @@ def compare_two(stdA: StdFrame, stdB: StdFrame) -> CompareResult:
         "CER_A_vs_B_mean": float(np.mean(detail["CER_A_vs_B"])) if len(detail) else np.nan,
         "A_source": tagA,
         "B_source": tagB,
+    }])
+    return CompareResult(detail, summary)
+
+
+# [ADD] 扩展：双 CSV 的完整指标（以 A.ref 优先作为基准；若 B.ref 存在且一致则无影响）
+def compare_two_full(stdA: StdFrame, stdB: StdFrame, long_thres: int, punc: str, keywords: List[str], target_cps: Optional[float]) -> CompareResult:
+    dfA = stdA.df.copy()
+    dfB = stdB.df.copy()
+    keyA = build_join_key(stdA)
+    keyB = build_join_key(stdB)
+
+    # 选择文本列
+    if stdA.asr is None or stdB.asr is None:
+        raise ValueError("双CSV完整指标：两侧都需存在 ASR 列（如 'asr' 或 'asr处理文本'）")
+
+    if stdA.ref is None and stdB.ref is None:
+        raise ValueError("双CSV完整指标：至少一侧需提供 REF 列（如 'text'/'原始文本'）")
+
+    # 合并对齐
+    A = pd.DataFrame({"key": keyA, "ref_A": dfA[stdA.ref] if stdA.ref else None, "asr_A": dfA[stdA.asr].astype(str), "wav_A": dfA[stdA.wav] if stdA.wav else None})
+    B = pd.DataFrame({"key": keyB, "ref_B": dfB[stdB.ref] if stdB.ref else None, "asr_B": dfB[stdB.asr].astype(str), "wav_B": dfB[stdB.wav] if stdB.wav else None})
+    merged = A.merge(B, on="key", how="inner")
+
+    if merged.empty:
+        raise ValueError("双CSV完整指标：按 key 无对齐样本（检查 '文件地址/utt_id/文件名' 等列）")
+
+    # 基准 REF：优先 A 的 ref；若缺失则用 B 的 ref
+    def choose_ref(row):
+        return (row["ref_A"] if pd.notna(row.get("ref_A", None)) else row.get("ref_B", "")) or ""
+
+    rows = []
+    for _, r in merged.iterrows():
+        ref = str(choose_ref(r))
+        asrA = str(r["asr_A"])
+        asrB = str(r["asr_B"])
+        wavA = str(r["wav_A"]) if pd.notna(r.get("wav_A")) else None
+        wavB = str(r["wav_B"]) if pd.notna(r.get("wav_B")) else None
+
+        cer_A = cer_char(ref, asrA)
+        cer_B = cer_char(ref, asrB)
+        wer_A = wer_word(ref, asrA)
+        wer_B = wer_word(ref, asrB)
+
+        sr_A = swallow_rate(ref, asrA, long_thres)
+        sr_B = swallow_rate(ref, asrB, long_thres)
+
+        pjv_A = prosody_jitter_var(ref, asrA, punc)
+        pjv_B = prosody_jitter_var(ref, asrB, punc)
+
+        kw_rec_A, kw_extra_A = keyword_metrics(ref, asrA, keywords)
+        kw_rec_B, kw_extra_B = keyword_metrics(ref, asrB, keywords)
+
+        se_A = speed_error(ref, wavA, target_cps)
+        se_B = speed_error(ref, wavB, target_cps)
+
+        rows.append({
+            "key": r["key"],
+            "ref": ref,
+            "asr_A": asrA,
+            "asr_B": asrB,
+            "CER_A": round(cer_A, 4),
+            "CER_B": round(cer_B, 4),
+            "WER_A": round(wer_A, 4),
+            "WER_B": round(wer_B, 4),
+            "Swallow_A": (round(sr_A,4) if sr_A is not None else None),
+            "Swallow_B": (round(sr_B,4) if sr_B is not None else None),
+            "ProsodyVar_A": round(pjv_A, 6),
+            "ProsodyVar_B": round(pjv_B, 6),
+            "KW_Recall_A": (round(kw_rec_A,4) if kw_rec_A is not None else None),
+            "KW_Recall_B": (round(kw_rec_B,4) if kw_rec_B is not None else None),
+            "KW_Extra_A": (round(kw_extra_A,4) if kw_extra_A is not None else None),
+            "KW_Extra_B": (round(kw_extra_B,4) if kw_extra_B is not None else None),
+            "SpeedErr_A": (round(se_A,4) if se_A is not None else None),
+            "SpeedErr_B": (round(se_B,4) if se_B is not None else None),
+        })
+
+    detail = pd.DataFrame(rows)
+    # 只在非空时计算均值
+    def _mean(series):
+        try:
+            return float(pd.to_numeric(series, errors="coerce").dropna().mean())
+        except Exception:
+            return float("nan")
+
+    summary = pd.DataFrame([{
+        "mode": "two_csv_metrics_vs_ref",
+        "n_join": int(len(detail)),
+        "CER_mean_A": _mean(detail["CER_A"]),
+        "CER_mean_B": _mean(detail["CER_B"]),
+        "WER_mean_A": _mean(detail["WER_A"]),
+        "WER_mean_B": _mean(detail["WER_B"]),
+        "Swallow_mean_A": _mean(detail["Swallow_A"]),
+        "Swallow_mean_B": _mean(detail["Swallow_B"]),
+        "ProsodyVar_mean_A": _mean(detail["ProsodyVar_A"]),
+        "ProsodyVar_mean_B": _mean(detail["ProsodyVar_B"]),
+        "KW_Recall_mean_A": _mean(detail["KW_Recall_A"]),
+        "KW_Recall_mean_B": _mean(detail["KW_Recall_B"]),
+        "KW_Extra_mean_A": _mean(detail["KW_Extra_A"]),
+        "KW_Extra_mean_B": _mean(detail["KW_Extra_B"]),
+        "SpeedErr_mean_A": _mean(detail["SpeedErr_A"]),
+        "SpeedErr_mean_B": _mean(detail["SpeedErr_B"]),
+        # A/B 差值（B-A，正数= B 更大，负数= B 更小/更好）
+        "CER_delta_B_minus_A": _mean(detail["CER_B"]) - _mean(detail["CER_A"]),
+        "WER_delta_B_minus_A": _mean(detail["WER_B"]) - _mean(detail["WER_A"]),
+        "Swallow_delta_B_minus_A": _mean(detail["Swallow_B"]) - _mean(detail["Swallow_A"]),
+        "ProsodyVar_delta_B_minus_A": _mean(detail["ProsodyVar_B"]) - _mean(detail["ProsodyVar_A"]),
+        "KW_Recall_delta_B_minus_A": _mean(detail["KW_Recall_B"]) - _mean(detail["KW_Recall_A"]),
+        "KW_Extra_delta_B_minus_A": _mean(detail["KW_Extra_B"]) - _mean(detail["KW_Extra_A"]),
+        "SpeedErr_delta_B_minus_A": _mean(detail["SpeedErr_B"]) - _mean(detail["SpeedErr_A"]),
     }])
     return CompareResult(detail, summary)
 
@@ -308,9 +662,17 @@ def run_cli(args) -> Tuple[str, str, str]:
     if csvA and csvB:
         stdA = standardize_csv(csvA)
         stdB = standardize_csv(csvB)
-        res = compare_two(stdA, stdB)
+        # [ADD] 比较前做标准化并写缓存 CSV
+        stdA = normalize_dataframe(stdA, 'A')
+        stdB = normalize_dataframe(stdB, 'B')
+        try:
+            res = compare_two_full(stdA, stdB, CONFIG['LONG_SENT_THRES'], CONFIG['PUNC_FOR_PROSODY'], CONFIG['KEYWORDS_DEFAULT'], CONFIG['TARGET_CHARS_PER_SEC'])
+        except Exception as _:
+            # 回退到原有简单 CER 对比
+            res = compare_two(stdA, stdB)
     else:
         std = standardize_csv(csvA or csvB)
+        std = normalize_dataframe(std, 'SINGLE')
         res = compare_single(std)
 
     detail_path, summary_path = _write_outputs(res, out_dir)
@@ -320,6 +682,7 @@ def run_cli(args) -> Tuple[str, str, str]:
     print("\n===== SUMMARY =====")
     print(report)
     print("\n输出：")
+    print(f" - 标准化缓存: {CONFIG.get('NORM_CACHE_DIR','./eval_out/_norm_cache')}")
     print(" - 明细:", os.path.relpath(detail_path))
     print(" - 汇总:", os.path.relpath(summary_path))
 
@@ -331,6 +694,7 @@ def run_cli(args) -> Tuple[str, str, str]:
 # =============================
 
 def run_ui():
+    # [ADD] UI 扩展：关键词 / 长句阈值 / 标点集 / 目标语速
     try:
         import gradio as gr
     except Exception:
@@ -339,11 +703,23 @@ def run_ui():
 
     CONTROL_URL = CONFIG["CONTROL_URL"]
 
-    def _go_eval(csv_a_path, csv_b_path, out_dir):
+    def _go_eval(csv_a_path, csv_b_path, out_dir, keywords, long_thres, punc_set, target_cps):
+        # 同时支持双CSV完整指标
         args = _Args(csv_a_path.strip() or "", csv_b_path.strip() or "", out_dir.strip() or CONFIG["OUT_DIR_DEFAULT"])
         try:
-            d, s, rep = run_cli(args)
-            return rep, d, s
+            if (csv_a_path.strip() and csv_b_path.strip()):
+                stdA = standardize_csv(csv_a_path.strip())
+                stdB = standardize_csv(csv_b_path.strip())
+                stdA = normalize_dataframe(stdA, 'A')
+                stdB = normalize_dataframe(stdB, 'B')
+                kws = [k.strip() for k in (keywords or '').split(',') if k.strip()] or CONFIG['KEYWORDS_DEFAULT']
+                res = compare_two_full(stdA, stdB, int(long_thres), (punc_set or CONFIG['PUNC_FOR_PROSODY']), kws, (float(target_cps) if target_cps else CONFIG['TARGET_CHARS_PER_SEC']))
+                d, s = _write_outputs(res, args.out_dir)
+                rep = _summary_text(res)
+                return rep, d, s
+            else:
+                d, s, rep = run_cli(args)
+                return rep, d, s
         except Exception as e:
             return f"[ERROR] {e}", None, None
 
@@ -385,13 +761,21 @@ def run_ui():
             csv_b_path = gr.Textbox(label="CSV B 路径（可选）", placeholder=r"D:\path\to\B.csv")
             out_dir = gr.Textbox(label="输出目录（相对路径优先）", value=CONFIG["OUT_DIR_DEFAULT"])
         btn_run = gr.Button("开始对比", variant="primary")
+        gr.Markdown("**说明**：双CSV模式将基于 `A/B.ASR` 对 `REF` 进行全指标评测；若读取不到 WAV 时长，则语速误差自动跳过。")
+
+        # [ADD] 缺失的四个输入组件（用于 _go_eval 的参数）
+        with gr.Row():
+            keywords = gr.Textbox(label="关键词列表（逗号分隔）", value=",".join(CONFIG["KEYWORDS_DEFAULT"]))
+            long_thres = gr.Number(label="长句阈值（字数）", value=CONFIG["LONG_SENT_THRES"])
+            punc_set = gr.Textbox(label="标点集合（韵律代理）", value=CONFIG["PUNC_FOR_PROSODY"])
+            target_cps = gr.Number(label="目标语速（字符/秒）", value=CONFIG["TARGET_CHARS_PER_SEC"])
 
         # ===== 输出区：报告文本 + 下载文件 =====
         report_out = gr.Textbox(label="对比汇总报告", lines=8)
         out_detail = gr.File(label="下载 detail.csv")
         out_summary = gr.File(label="下载 summary.csv")
 
-        btn_run.click(_go_eval, [csv_a_path, csv_b_path, out_dir], [report_out, out_detail, out_summary])
+        btn_run.click(_go_eval, [csv_a_path, csv_b_path, out_dir, keywords, long_thres, punc_set, target_cps], [report_out, out_detail, out_summary])
 
     # 启动参数（与 asr 对齐）
     if CONFIG["GRADIO_QUEUE"]:
