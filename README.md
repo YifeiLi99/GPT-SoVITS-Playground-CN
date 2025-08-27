@@ -91,7 +91,7 @@
 
 1) 克隆并创建环境
 ```bash
-git clone https://github.com/<yourname>/GPT-SoVITS-Playground-CN.git
+git clone https://github.com/YifeiLi99/GPT-SoVITS-Playground-CN.git
 cd GPT-SoVITS-Playground-CN
 
 # 注意：后续创建环境部分最好参照GPT-SoVITS原作者的攻略创建
